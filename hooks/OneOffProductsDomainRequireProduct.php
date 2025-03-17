@@ -1,182 +1,175 @@
+// HOOK UPDATED TO WORK WITH WHMCS 8.11
+
 <?php
 
-/**
- * One-off Products/Services & Domain purchase require Product/Service
- *
- * @package     WHMCS
- * @copyright   Katamaze
- * @link        https://katamaze.com
- * @author      Davide Mantenuto <info@katamaze.com>
- */
-
 use WHMCS\Database\Capsule;
+use WHMCS\Carbon;
+use WHMCS\Session;
+use WHMCS\Module\Gateway;
 
-define('kt_onetimeProducts', array()); // Array of product IDs to treat as "one-off" (customer is not allowed to order the same product multiple times
-define('kt_onetimeProductGroups', array()); // Same as above but for product group IDs. All producs inside such groups are treated as one-off
-define('kt_firstTimerTollerance', true); // Product-based restrictions are disabled for new customers placing their first order with you
-define('kt_notRepeatable', true); // If a customer already has a one-off product, he can't purchase further one-offs ($firstTimerTollerance is ignored)
-define('kt_domainRequiresProduct', false); // Domain purchase is allowed only if any of the following conditions is met: a) Customer has an existing product/service (`Pending` and `Terminated` don't count) b) Customer is purchasing a domain and a product/service
-define('kt_onClientRegister', false); // Ordering one-off products is possible only for clients who registered within the last X number of days. Leave false to disable
-define('kt_promptRemoval', 'modal'); // Choose one of the following options: "bootstrap-alert", "modal", "js-alert" (works on Six template. Change jQuery selectors accordingly for custom templates)
-define('kt_textDisallowed', 'The Product/Service can be purchased only once.'); // Don't forget to "\" escape
-define('kt_textRequireProduct', 'Domain purchase require an active Product/Service.'); // Don't forget to "\" escape
+// Configuration
+define('KT_ONETIME_PRODUCTS', []); // Array of product IDs to treat as "one-off"
+define('KT_ONETIME_PRODUCT_GROUPS', []); // Array of product group IDs to treat as one-off
+define('KT_FIRST_TIMER_TOLERANCE', true); // Disable restrictions for new customers' first order
+define('KT_NOT_REPEATABLE', true); // Prevent purchasing multiple one-off products
+define('KT_DOMAIN_REQUIRES_PRODUCT', false); // Require active product for domain purchase
+define('KT_ON_CLIENT_REGISTER', false); // Days limit for new client registration to order one-off products
+define('KT_PROMPT_REMOVAL', 'modal'); // Removal prompt type: "bootstrap-alert", "modal", "js-alert"
+define('KT_TEXT_DISALLOWED', 'This product can only be activated once.'); // Disallowed product message
+define('KT_TEXT_REQUIRE_PRODUCT', 'Domain purchase requires an active product/service.'); // Product requirement message
 
-add_hook('ClientAreaHeadOutput', 1, function($vars)
-{
-    if ($_SESSION['cart']['products'] AND (kt_onetimeProductGroups OR kt_onetimeProducts))
-    {
-        $disallowedPids = Capsule::table('tblproducts')->whereIn('gid', kt_onetimeProductGroups)->orWhereIn('id', kt_onetimeProducts)->pluck('id');
-        $productsInCart = array_column($_SESSION['cart']['products'], 'pid');
+add_hook('ShoppingCartValidateProductUpdate', 1, function($vars) {
+    try {
+        $cart = Session::get('cart');
+        if (empty($cart['products'])) {
+            return;
+        }
 
-        if ($_SESSION['uid'] AND kt_onClientRegister)
-        {
-            $isNewCustomer = Capsule::table('tblclients')->where('id', '=', $_SESSION['uid'])->whereDate('datecreated', '>=', Carbon::now()->subDays(kt_onClientRegister))->pluck('id');
+        $disallowedPids = Capsule::table('tblproducts')
+            ->whereIn('gid', KT_ONETIME_PRODUCT_GROUPS)
+            ->orWhereIn('id', KT_ONETIME_PRODUCTS)
+            ->get()
+            ->pluck('id')
+            ->all();
 
-            if (!$isNewCustomer)
-            {
-                foreach ($_SESSION['cart']['products'] as $k => $v)
-                {
-                    if (in_array($v['pid'], $disallowedPids))
-                    {
-                        $removedFromCart = true;
-                        unset($_SESSION['cart']['products'][$k]);
-                    }
-                }
+        $productsInCart = array_column($cart['products'], 'pid');
+        $userId = Session::get('uid');
+
+        if ($userId && KT_ON_CLIENT_REGISTER) {
+            $isNewCustomer = Capsule::table('tblclients')
+                ->where('id', $userId)
+                ->where('datecreated', '>=', Carbon::now()->subDays((int)KT_ON_CLIENT_REGISTER))
+                ->exists();
+
+            if (!$isNewCustomer) {
+                $cart['products'] = array_filter($cart['products'], function($product) use ($disallowedPids) {
+                    return !in_array($product['pid'], $disallowedPids);
+                });
             }
         }
 
-        if ($_SESSION['uid'])
-        {
-            $userProducts = Capsule::table('tblhosting')->where('userid', '=', $_SESSION['uid'])->WhereIn('packageid', $disallowedPids)->groupBy('packageid')->pluck('packageid');
+        if ($userId) {
+            $userProducts = Capsule::table('tblhosting')
+                ->where('userid', $userId)
+                ->whereIn('packageid', $disallowedPids)
+                ->groupBy('packageid')
+                ->get()
+                ->pluck('packageid')
+                ->all();
+        } else {
+            $userProducts = [];
         }
 
-        if (kt_notRepeatable)
-        {
-            $groupByProducts = array_count_values($productsInCart);
-            $groupByProductsKeys = array_keys($groupByProducts);
-            $i = 1;
+        $productTotals = [];
+        foreach ($cart['products'] as $k => $product) {
+            $productTotals[$product['pid']] = ($productTotals[$product['pid']] ?? 0) + 1;
 
-            foreach ($_SESSION['cart']['products'] as $k => $v)
-            {
-                if (in_array($v['pid'], $groupByProductsKeys) AND in_array($v['pid'], $disallowedPids))
-                {
-                    if ($i > 1)
-                    {
-                        $removedFromCart = true;
-                        unset($_SESSION['cart']['products'][count($_SESSION['cart']['products'])-1]);
-                    }
-
-                    $i++;
-                }
-            }
-        }
-        elseif (!kt_firstTimerTollerance)
-        {
-            foreach ($productTotals as $k => $v)
-            {
-                if ($v > 1)
-                {
-                    $removedFromCart = true;
-                    unset($_SESSION['cart']['products'][count($_SESSION['cart']['products'])-1]);
-                }
-            }
-        }
-
-        foreach ($_SESSION['cart']['products'] as $k => $v)
-        {
-            if (in_array($v['pid'], $userProducts))
-            {
+            if (in_array($product['pid'], $userProducts)) {
+                unset($cart['products'][$k]);
                 $removedFromCart = true;
-                unset($_SESSION['cart']['products'][$k]);
             }
 
-            $productTotals[$v['pid']]++;
+            if (KT_NOT_REPEATABLE && in_array($product['pid'], $disallowedPids) && $productTotals[$product['pid']] > 1) {
+                unset($cart['products'][$k]);
+                $removedFromCart = true;
+            }
         }
 
-        if ($removedFromCart)
-        {
+        if (!KT_FIRST_TIMER_TOLERANCE) {
+            foreach ($productTotals as $pid => $count) {
+                if ($count > 1 && in_array($pid, $disallowedPids)) {
+                    $cart['products'] = array_filter($cart['products'], function($product) use ($pid) {
+                        return $product['pid'] !== $pid;
+                    });
+                    $removedFromCart = true;
+                }
+            }
+        }
+
+        Session::set('cart', $cart);
+
+        if (!empty($removedFromCart)) {
             header('Location: cart.php?a=view&disallowed=1');
-            die();
+            exit;
         }
-    }
 
-    if ($_SESSION['cart']['domains'] AND kt_domainRequiresProduct)
-    {
-        $userHasProduct = Capsule::table('tblhosting')->where('userid', '=', $_SESSION['uid'])->whereNotIn('domainstatus', array('Pending', 'Terminated'))->pluck('id');
+        if (!empty($cart['domains']) && KT_DOMAIN_REQUIRES_PRODUCT) {
+            $userHasProduct = Capsule::table('tblhosting')
+                ->where('userid', $userId)
+                ->whereNotIn('domainstatus', ['Pending', 'Terminated'])
+                ->exists();
 
-        if (!$userHasProduct AND !$_SESSION['cart']['products'])
-        {
-            unset($_SESSION['cart']['domains']);
-            header('Location: cart.php?a=view&requireProduct=1');
-            die();
+            if (!$userHasProduct && empty($cart['products'])) {
+                $cart['domains'] = [];
+                Session::set('cart', $cart);
+                header('Location: cart.php?a=view&requireProduct=1');
+                exit;
+            }
         }
+    } catch (\Exception $e) {
+        logActivity("Hook Error: " . $e->getMessage());
     }
 });
 
-add_hook('ClientAreaHeadOutput', 1, function($vars)
-{
-    if ($vars['filename'] == 'cart' AND $_GET['a'] == 'view')
-    {
-        if ($_GET['disallowed']): $text = kt_textDisallowed;
-        elseif ($_GET['requireProduct']): $text = kt_textRequireProduct; endif;
-
-        if (kt_promptRemoval == 'bootstrap-alert')
-        {
-            $code = <<<HTML
-$("form[action='/cart.php?a=view']").prepend('<div class="alert alert-warning text-center" role="alert">{$text}</div>');
-HTML;
-        }
-        elseif (kt_promptRemoval == 'modal')
-        {
-            $code = <<<HTML
-$("#modalAjax .modal-header").hide();
-$("#modalAjax .modal-body").html('<div class="text-center" style="padding:15px"><i class="far fa-grin-beam-sweat fa-5x"></i></div><div class="text-center" style="padding:15px">{$text}</div>');
-$('#modalAjax .loader').hide();
-$('#modalAjax .modal-submit').hide();
-$("#modalAjax").modal('show');
-HTML;
-        }
-        elseif (kt_promptRemoval == 'js-alert')
-        {
-            $code = <<<HTML
-alert('{$text}');
-HTML;
+add_hook('ClientAreaHeadOutput', 1, function($vars) {
+    if ($vars['filename'] == 'cart' && isset($_GET['a']) && $_GET['a'] == 'view') {
+        $text = '';
+        if (isset($_GET['disallowed'])) {
+            $text = KT_TEXT_DISALLOWED;
+        } elseif (isset($_GET['requireProduct'])) {
+            $text = KT_TEXT_REQUIRE_PRODUCT;
         }
 
-        if ($_GET['disallowed'] OR $_GET['requireProduct'])
-        {
+        if (!empty($text)) {
+            $code = '';
+            switch (KT_PROMPT_REMOVAL) {
+                case 'bootstrap-alert':
+                    $code = "$('form[action=\"/cart.php?a=view\"]').prepend('<div class=\"alert alert-warning text-center\" role=\"alert\">{$text}</div>');";
+                    break;
+                case 'modal':
+                    $code = <<<JS
+                    $("#modalAjax .modal-header").hide();
+                    $("#modalAjax .modal-body").html('<div class="text-center" style="padding:15px"><i class="far fa-grin-beam-sweat fa-5x"></i></div><div class="text-center" style="padding:15px">{$text}</div>');
+                    $('#modalAjax .loader').hide();
+                    $('#modalAjax .modal-submit').hide();
+                    $("#modalAjax").modal('show');
+                    JS;
+                    break;
+                case 'js-alert':
+                    $code = "alert('{$text}');";
+                    break;
+            }
+
             return <<<HTML
-<script type="text/javascript">
-$(document).ready(function() {
-    {$code}
-});
-</script>
-HTML;
+            <script type="text/javascript">
+            $(document).ready(function() {
+                {$code}
+            });
+            </script>
+            HTML;
         }
     }
 });
 
-add_hook('AdminAreaHeadOutput', 1, function($vars)
-{
-    if ($vars['filename'] == 'configproducts')
-    {
-        $objPrododucts = json_encode(kt_onetimeProducts);
-        $objGroups = json_encode(kt_onetimeProductGroups);
+add_hook('AdminAreaHeadOutput', 1, function($vars) {
+    if ($vars['filename'] == 'configproducts') {
+        $objProducts = json_encode(KT_ONETIME_PRODUCTS);
+        $objGroups = json_encode(KT_ONETIME_PRODUCT_GROUPS);
 
         return <<<HTML
-<script type="text/javascript">
-$(document).ready(function() {
-    $.each({$objPrododucts}, function(key, value) {
-        $('#tableBackground > table > tbody  > tr').find("a[href$='?action=edit&id=" + value + "']").closest('tr').find('td').css('background-color', '#d2eed0');
-        $('#tableBackground > table > tbody  > tr').find("a[href$='?action=edit&id=" + value + "']").closest('tr').find('td:first').append(' <label class="label label-success">Promo</label>');
-    });
+        <script type="text/javascript">
+        $(document).ready(function() {
+            $.each({$objProducts}, function(key, value) {
+                $('#tableBackground > table > tbody > tr').find("a[href$='?action=edit&id=" + value + "']").closest('tr').find('td').css('background-color', '#d2eed0');
+                $('#tableBackground > table > tbody > tr').find("a[href$='?action=edit&id=" + value + "']").closest('tr').find('td:first').append(' <label class="label label-success">Promo</label>');
+            });
 
-    $.each({$objGroups}, function(key, value) {
-        $('#tableBackground > table > tbody  > tr').find("a[href$='?action=editgroup&ids=" + value + "']").closest('tr').find('td').css('background-color', '#d2eed0');
-        $('#tableBackground > table > tbody  > tr').find("a[href$='?action=editgroup&ids=" + value + "']").closest('tr').find('td:first > div.prodGroup').append(' <label class="label label-success">Promo</label>');
-    });
-});
-</script>
-HTML;
+            $.each({$objGroups}, function(key, value) {
+                $('#tableBackground > table > tbody > tr').find("a[href$='?action=editgroup&ids=" + value + "']").closest('tr').find('td').css('background-color', '#d2eed0');
+                $('#tableBackground > table > tbody > tr').find("a[href$='?action=editgroup&ids=" + value + "']").closest('tr').find('td:first > div.prodGroup').append(' <label class="label label-success">Promo</label>');
+            });
+        });
+        </script>
+        HTML;
     }
 });
